@@ -1,0 +1,229 @@
+#!/usr/bin/env python
+#coding=gbk
+
+import pexpect
+import sys
+import os
+import ConfigParser
+import getpass
+import struct
+import fcntl
+import termios
+import signal
+
+
+def print_usage():
+    help_msg = '''
+    使用方法：
+    autossh [server] [command] [-h]
+        server为需要连接的server名，支持部分匹配，如果有多个server匹配成功，由用户手动选择
+        server为空，由用户从所有可选server list中进行手动选择
+        command，连接成功后执行command退出，如果command为空连接成功后进入交互模式
+    '''
+    print help_msg
+    sys.exit(-1)
+
+
+class Conf(object):
+    def __init__(self):
+        self.user = ""
+        self.relay_server = ""
+        self.server_dict = {}
+
+
+def pase_config():
+    config_path = ""
+    option1 = './autossh.conf'
+    option2 = os.environ['HOME'] + '/.autossh.conf'
+    if os.path.isfile(option1):
+        config_path = option1
+    elif os.path.isfile(option2):
+        config_path = option2
+    else:
+        print "can't find autossh conf"
+        return None
+
+    try:
+        conf = Conf()
+        config = ConfigParser.ConfigParser()
+        config.read(config_path)
+        if config.has_option("relay", "user"):
+            conf.user = config.get("relay", "user")
+        if config.has_option("relay", "relay_server"):
+            conf.relay_server = config.get("relay", "relay_server")
+
+        for (server, passwd) in config.items("servers"):
+            conf.server_dict[server] = passwd
+        return conf
+    except Exception, e:
+        print "parse_config [%s] failed, msg[%s]" % (config_path, str(e))
+        return None
+
+
+class LoginController(object):
+    instance = None
+
+    @staticmethod
+    def get_instance():
+        if not LoginController.instance:
+            LoginController.instance = LoginController()
+        return LoginController.instance
+
+    @staticmethod
+    def on_console_winsize_change(signum, frame):
+        signal.signal(signal.SIGWINCH, signal.SIG_IGN)
+        LoginController.get_instance().adjust_ssh_client_size()
+        signal.signal(signal.SIGWINCH, LoginController.on_console_winsize_change)
+
+    def __init__(self):
+        signal.signal(signal.SIGWINCH, LoginController.on_console_winsize_change)
+        pass
+
+    def adjust_ssh_client_size(self):
+        #adjust the console window size of the ssh client
+        s = struct.pack("HHHH", 0, 0, 0, 0)
+        a = struct.unpack('hhhh', fcntl.ioctl(sys.stdout.fileno(), termios.TIOCGWINSZ, s))
+        self._ssh_client.setwinsize(a[0], a[1])
+
+    def auto_login(self, conf, login_server, command):
+        self._conf = conf
+        self._ssh_client = None
+        self._login_server = login_server
+
+        ssh_cmd = ""
+        expect_dict = {}
+        login_relay_str = "Password: "
+        login_relay_success_str = '-bash-baidu-ssl'
+        login_server_str = "%s's password: " % (login_server[0])
+        login_server_success_str = r'[%s ~]$' % (login_server[0])
+        login_confirm_str = r'Are you sure you want to continue connecting (yes/no)?'
+        expect_dict[login_confirm_str] = self._handle_login_confirm
+        if conf.relay_server != "":
+            #need to login relay
+            ssh_cmd = 'ssh %s@%s' % (conf.user, conf.relay_server)
+            expect_dict[login_relay_str] = self._handle_login_relay
+            expect_dict[login_relay_success_str] = self._handle_login_workserver
+            expect_dict[login_server_str] = self._handle_login_workserver_passwd
+        else:
+            ssh_cmd = 'ssh %s' % (login_server[0])
+            expect_dict[login_server_str] = self._handle_login_workserver_passwd
+
+        if command == "":
+            expect_dict[login_server_success_str] = self._handle_login_success
+        else:
+            self._command = command
+            self._login_success_str = login_server_success_str
+            expect_dict[login_server_success_str] = self._handle_excute_command
+
+        self._pexpect_main_loop(ssh_cmd, expect_dict)
+
+    def _handle_login_relay(self):
+        passwd_hint = "please input token passwd for %s: " % (self._conf.relay_server)
+        try:
+            pwd = getpass.getpass(prompt=passwd_hint)
+            self._ssh_client.sendline(pwd)
+        except Exception:
+            sys.exit(-1)
+
+    def _handle_login_workserver(self):
+        self._ssh_client.sendline("ssh " + self._login_server[0])
+
+    def _handle_login_workserver_passwd(self):
+        self._ssh_client.sendline(self._login_server[1])
+
+    def _handle_login_confirm(self):
+        self._ssh_client.sendline('yes')
+
+    def _handle_login_success(self):
+        self.adjust_ssh_client_size()
+        self._ssh_client.interact()
+        self._ssh_client.close()
+        self._run = False
+
+    def _handle_excute_command(self):
+        self._ssh_client.sendline(self._command)
+        self._ssh_client.expect_exact(self._command)
+        self._ssh_client.expect_exact(self._login_success_str)
+        out_str = self._ssh_client.before.strip("\r\n")
+        sys.stdout.write(out_str)
+        self._ssh_client.close()
+        self._run = False
+
+    def _pexpect_main_loop(self, ssh_cmd, expect_dict):
+        expect_list = []
+        handler_list = []
+        for (expect_string, handler) in expect_dict.items():
+            expect_list.append(expect_string)
+            handler_list.append(handler)
+
+        self._ssh_client = pexpect.spawn(ssh_cmd)
+        self._run = True
+        try:
+            while self._run:
+                expect_no = self._ssh_client.expect_exact(expect_list, timeout=10)
+                if expect_no >= len(expect_list):
+                    print "unexpect pexpect error, return"
+                handler_list[expect_no]()
+
+        except pexpect.EOF:
+            print "ssh eof"
+            self._ssh_client.close()
+
+        except pexpect.TIMEOUT:
+            print "ssh timeout"
+            self._ssh_client.close()
+
+        except Exception, e:
+            print "other Exception: " + str(e)
+            self._ssh_client.close()
+
+
+def match_server_manually(server_info_list):
+    print "find more than one server, pleaser select one:"
+    n = 0
+    for (server, passwd) in server_info_list:
+        print "%d\t%s" % (n, server)
+        n += 1
+    select = sys.stdin.readline()
+    select_num = int(select)
+    return server_info_list[select_num]
+
+
+def match_server(server_dict, input_server):
+    select_server = None
+    if input_server == "":
+        select_server = match_server_manually(server_dict.items())
+    else:
+        select_server_list = [(server, passwd) for (server, passwd) in server_dict.items()
+                                if server.find(input_server) >= 0]
+        if len(select_server_list) > 1:
+            select_server = match_server_manually(select_server_list)
+        elif len(select_server_list) == 1:
+            select_server = select_server_list[0]
+        else:
+            print "no server matched"
+            sys.exit(-1)
+    return select_server
+
+
+if __name__ == '__main__':
+    input_server = ""
+    command = ""
+    argv_num = len(sys.argv)
+    if argv_num == 1:
+        pass
+    elif argv_num == 2:
+        input_server = sys.argv[1]
+        if input_server == "-h":
+            print_usage()
+    elif argv_num == 3:
+        input_server = sys.argv[1]
+        command = sys.argv[2]
+    else:
+        print_usage()
+
+    conf = pase_config()
+    if not conf:
+        sys.exit(-1)
+    login_server = match_server(conf.server_dict, input_server)
+    LoginController.get_instance().auto_login(conf, login_server, command)
